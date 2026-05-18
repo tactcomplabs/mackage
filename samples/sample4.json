@@ -1,0 +1,21 @@
+{
+  "package": "sample4",
+  "version": "use_git_hash",
+  "preinstall_script": "/path/to/script",
+  "postinstall_script": "/path/to/script",
+  "plist": "/path/to/app.plist",
+  "config": "/path/to/distribution.xml",
+
+  "resources":{
+    "welcome": "/path/to/welcome.html",
+    "license": "/path/to/license.html",
+    "background_img": "/path/to/img.png"
+  },
+
+  "payload":[
+    "file":{
+      "src": "/path/to/source/file1",
+      "dest": "/path/to/destination/file2"
+    }
+  ]
+}
