@@ -1,5 +1,7 @@
 # mackage
 
+![mackage](mackage.png)
+
 `mackage` is a Python wrapper around Apple's `pkgbuild` and `productbuild` tools
 that builds a fully-formed macOS `.pkg` installer from a single JSON
 configuration file. It handles payload staging, install scripts, LaunchDaemon
