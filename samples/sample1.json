@@ -5,6 +5,7 @@
   "postinstall_script": "/path/to/script",
   "plist": "/path/to/app.plist",
   "config": "/path/to/distribution.xml",
+  "identifier_prefix": "com.my_company",
 
   "resources":{
     "welcome": "/path/to/welcome.html",

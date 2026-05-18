@@ -281,6 +281,7 @@ def generate_distribution_xml(
     component_pkg: Path,
     resources_staged: dict[str, Path],
     work_dir: Path,
+    identifier: str,
 ) -> Path:
     """
     Build a distribution.xml if not supplied in the config.
@@ -298,7 +299,6 @@ def generate_distribution_xml(
     step("Generating distribution.xml")
     pkg_name    = cfg["package"]
     version     = cfg["version"]
-    identifier  = f"com.company.{pkg_name}"
     pkg_ref     = component_pkg.name
 
     # Build optional UI elements
@@ -361,7 +361,7 @@ def run_pkgbuild(
         str(component_pkg),
     ]
     if has_scripts:
-        cmd = cmd[:2] + ["--scripts", str(scripts_dir)] + cmd[2:]
+        cmd = cmd[:3] + ["--scripts", str(scripts_dir)] + cmd[3:]
     run(cmd)
     ok(f"Component package: {component_pkg}")
 
@@ -405,6 +405,9 @@ def main() -> None:
               postinstall_script (optional) Path to postinstall script
               plist              (optional) Path to LaunchDaemon plist (auto-generated if omitted)
               config             (optional) Path to distribution.xml (auto-generated if omitted)
+              identifier_prefix  (optional) Reverse-DNS prefix prepended to <package> for the
+                                 bundle identifier (default: "com.company"). Ignored if
+                                 --identifier is given on the command line.
               resources          (optional) Object with: welcome, license, background_img paths
         """),
     )
@@ -452,7 +455,7 @@ def main() -> None:
 
     pkg_name   = cfg["package"]
     version    = cfg["version"]
-    identifier = args.identifier or f"com.company.{pkg_name}"
+    identifier = args.identifier or f"{cfg.get('identifier_prefix', 'com.company')}.{pkg_name}"
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -506,6 +509,7 @@ def main() -> None:
             component_pkg=component_pkg,
             resources_staged=resources_staged,
             work_dir=work_dir,
+            identifier=identifier,
         )
 
         # ── productbuild ────────────────────────────────────────────────────
