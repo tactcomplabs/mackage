@@ -13,7 +13,7 @@
   },
 
   "payload":[
-    "file":{
+    {
       "src": "/path/to/source/file1",
       "dest": "/path/to/destination/file2"
     }

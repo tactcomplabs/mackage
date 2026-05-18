@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""
+mackage — Automate macOS .pkg creation via pkgbuild + productbuild.
+
+Usage:
+    python3 mackage <config.json> [--output-dir /path/to/output] [--sign "Developer ID Installer: ..."] [--keep-staging]
+
+The JSON schema is documented in README inside this file.  Run with --help for options.
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# JSON SCHEMA (validated at runtime)
+# ---------------------------------------------------------------------------
+# Required top-level keys   : package, version, payload
+# Optional top-level keys   : preinstall_script, postinstall_script, plist,
+#                             config, resources { welcome, license, background_img }
+#
+# payload is a list of objects, each with:
+#   src  – absolute path to the source file on this machine
+#   dest – absolute path where the file should land on the target machine
+# ---------------------------------------------------------------------------
+
+
+# ── ANSI colour helpers ─────────────────────────────────────────────────────
+
+def _c(code: str, text: str) -> str:
+    """Wrap text in an ANSI colour code (no-op on Windows or non-TTY)."""
+    if sys.stdout.isatty() and platform.system() != "Windows":
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+def info(msg: str)    -> None: print(_c("34", f"[INFO]  {msg}"))
+def ok(msg: str)      -> None: print(_c("32", f"[OK]    {msg}"))
+def warn(msg: str)    -> None: print(_c("33", f"[WARN]  {msg}"), file=sys.stderr)
+def error(msg: str)   -> None: print(_c("31", f"[ERROR] {msg}"), file=sys.stderr)
+def step(msg: str)    -> None: print(_c("36", f"\n── {msg} ──"))
+
+
+# ── Utility helpers ─────────────────────────────────────────────────────────
+
+def require_macos() -> None:
+    if platform.system() != "Darwin":
+        error("pkgbuild and productbuild are macOS-only tools.")
+        sys.exit(1)
+
+
+def require_tool(name: str) -> str:
+    """Return the full path to a CLI tool or abort."""
+    path = shutil.which(name)
+    if not path:
+        error(f"Required tool '{name}' not found. Install Xcode Command Line Tools.")
+        sys.exit(1)
+    return path
+
+
+def run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    """Run a subprocess, printing the command for transparency."""
+    info("$ " + " ".join(str(c) for c in cmd))
+    result = subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        error(f"Command failed (exit {result.returncode}).")
+        if capture and result.stderr:
+            print(result.stderr, file=sys.stderr)
+        sys.exit(result.returncode)
+    return result
+
+
+def validate_config(cfg: dict) -> None:
+    """Validate required fields and types in the JSON config."""
+    required = ("package", "version", "payload")
+    for key in required:
+        if key not in cfg:
+            error(f"Missing required JSON key: '{key}'")
+            sys.exit(1)
+
+    if not re.match(r"^[A-Za-z0-9._-]+$", cfg["package"]):
+        error("'package' must contain only letters, digits, dots, hyphens, underscores.")
+        sys.exit(1)
+
+    if not isinstance(cfg["payload"], list) or len(cfg["payload"]) == 0:
+        error("'payload' must be a non-empty list.")
+        sys.exit(1)
+
+    for i, entry in enumerate(cfg["payload"]):
+        if not isinstance(entry, dict):
+            error(f"payload[{i}] must be a JSON object.")
+            sys.exit(1)
+        for field in ("src", "dest"):
+            if field not in entry:
+                error(f"payload[{i}] is missing the '{field}' key.")
+                sys.exit(1)
+
+
+def resolve_path(raw: str, config_dir: Path) -> Path:
+    """Resolve a path that may be absolute or relative to the config file's directory."""
+    p = Path(raw)
+    if not p.is_absolute():
+        p = config_dir / p
+    return p.expanduser().resolve()
+
+
+# ── Staging helpers ─────────────────────────────────────────────────────────
+
+def stage_payload(cfg: dict, config_dir: Path, staging_root: Path) -> None:
+    """
+    Copy every payload file into staging_root, mirroring the destination path.
+
+    staging_root/  ←→  / on target machine
+      usr/local/bin/MyApp
+      Library/LaunchDaemons/com.example.myapp.plist
+      …
+    """
+    step("Staging payload files")
+    for entry in cfg["payload"]:
+        src  = resolve_path(entry["src"],  config_dir)
+        dest = Path(entry["dest"])
+
+        if not src.exists():
+            error(f"Source file not found: {src}")
+            sys.exit(1)
+
+        # dest is an absolute path on the target, strip leading /
+        relative_dest = Path(str(dest).lstrip("/"))
+        staged = staging_root / relative_dest
+        staged.parent.mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(src, staged)
+        # Preserve executable bit if set on source
+        if os.access(src, os.X_OK):
+            staged.chmod(staged.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        ok(f"Staged: {src} → {staged}")
+
+    # Optional plist (if not already in payload, add it)
+    plist_raw = cfg.get("plist")
+    if plist_raw:
+        plist_src = resolve_path(plist_raw, config_dir)
+        if not plist_src.exists():
+            error(f"Plist file not found: {plist_src}")
+            sys.exit(1)
+        # Default install location for a LaunchDaemon plist
+        plist_dest = staging_root / "Library" / "LaunchDaemons" / plist_src.name
+        plist_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(plist_src, plist_dest)
+        plist_dest.chmod(0o644)
+        ok(f"Staged plist: {plist_src} → {plist_dest}")
+
+
+def stage_scripts(cfg: dict, config_dir: Path, scripts_dir: Path) -> None:
+    """Copy optional pre/postinstall scripts into the scripts staging directory."""
+    step("Staging install scripts")
+    copied = False
+    for script_key in ("preinstall_script", "postinstall_script"):
+        raw = cfg.get(script_key)
+        if not raw:
+            continue
+        src = resolve_path(raw, config_dir)
+        if not src.exists():
+            error(f"Script not found: {src}")
+            sys.exit(1)
+        # pkgbuild expects the script named exactly 'preinstall' or 'postinstall'
+        name = "preinstall" if "pre" in script_key else "postinstall"
+        dest = scripts_dir / name
+        shutil.copy2(src, dest)
+        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        ok(f"Staged script: {src} → {dest} (as '{name}')")
+        copied = True
+    if not copied:
+        info("No install scripts specified — skipping.")
+
+
+def stage_resources(cfg: dict, config_dir: Path, resources_dir: Path) -> dict[str, Path]:
+    """
+    Copy installer UI resources (welcome, license, background) to resources_dir.
+    Returns a mapping of resource type → staged path.
+    """
+    step("Staging installer resources")
+    resources_cfg = cfg.get("resources", {})
+    staged: dict[str, Path] = {}
+
+    mapping = {
+        "welcome":        ("welcome.html",    "text/html"),
+        "license":        ("license.html",    "text/html"),
+        "background_img": ("background.png",  "image/png"),
+    }
+
+    for key, (filename, _) in mapping.items():
+        raw = resources_cfg.get(key)
+        if not raw:
+            continue
+        src = resolve_path(raw, config_dir)
+        if not src.exists():
+            warn(f"Resource '{key}' not found at {src} — skipping.")
+            continue
+        dest = resources_dir / filename
+        shutil.copy2(src, dest)
+        staged[key] = dest
+        ok(f"Staged resource '{key}': {src} → {dest}")
+
+    if not staged:
+        info("No installer resources specified.")
+    return staged
+
+
+# ── Plist / distribution.xml generation ─────────────────────────────────────
+
+def generate_plist(cfg: dict, config_dir: Path, staging_root: Path, work_dir: Path) -> Path:
+    """
+    If no plist is given, generate a minimal LaunchDaemon plist and stage it.
+    Returns the path to the generated (or confirmed existing) plist.
+    """
+    if cfg.get("plist"):
+        # Already handled in stage_payload
+        return resolve_path(cfg["plist"], config_dir)
+
+    step("Generating default LaunchDaemon plist")
+    pkg_name = cfg["package"]
+    # Use the first payload binary as the program path on the target
+    first_payload_dest = cfg["payload"][0]["dest"]
+
+    plist_content = textwrap.dedent(f"""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>com.company.{pkg_name}</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>{first_payload_dest}</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <true/>
+            <key>StandardOutPath</key>
+            <string>/var/log/{pkg_name}.log</string>
+            <key>StandardErrorPath</key>
+            <string>/var/log/{pkg_name}.err</string>
+        </dict>
+        </plist>
+    """)
+
+    plist_filename = f"com.company.{pkg_name}.plist"
+    plist_path = work_dir / plist_filename
+    plist_path.write_text(plist_content)
+
+    # Also stage it
+    plist_staged = staging_root / "Library" / "LaunchDaemons" / plist_filename
+    plist_staged.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(plist_path, plist_staged)
+    plist_staged.chmod(0o644)
+
+    ok(f"Generated plist: {plist_path}")
+    return plist_path
+
+
+def generate_distribution_xml(
+    cfg: dict,
+    config_dir: Path,
+    component_pkg: Path,
+    resources_staged: dict[str, Path],
+    work_dir: Path,
+) -> Path:
+    """
+    Build a distribution.xml if not supplied in the config.
+    Returns the path to the distribution.xml to use.
+    """
+    raw_config = cfg.get("config")
+    if raw_config:
+        src = resolve_path(raw_config, config_dir)
+        if not src.exists():
+            error(f"distribution.xml not found: {src}")
+            sys.exit(1)
+        info(f"Using existing distribution.xml: {src}")
+        return src
+
+    step("Generating distribution.xml")
+    pkg_name    = cfg["package"]
+    version     = cfg["version"]
+    identifier  = f"com.company.{pkg_name}"
+    pkg_ref     = component_pkg.name
+
+    # Build optional UI elements
+    welcome_line    = '<welcome    file="welcome.html"    mime-type="text/html"/>'    if "welcome"        in resources_staged else ""
+    license_line    = '<license    file="license.html"    mime-type="text/html"/>'    if "license"        in resources_staged else ""
+    background_line = '<background file="background.png" alignment="bottomleft" scaling="none"/>' if "background_img" in resources_staged else ""
+
+    xml = textwrap.dedent(f"""\
+        <?xml version="1.0" encoding="utf-8"?>
+        <installer-gui-script minSpecVersion="2">
+
+            <title>{pkg_name} {version}</title>
+            {background_line}
+            {welcome_line}
+            {license_line}
+
+            <os-version min="10.15"/>
+            <options customize="never" require-scripts="false" rootVolumeOnly="true"/>
+
+            <pkg-ref id="{identifier}" version="{version}">{pkg_ref}</pkg-ref>
+
+            <choices-outline>
+                <line choice="{identifier}"/>
+            </choices-outline>
+
+            <choice id="{identifier}"
+                    title="{pkg_name}"
+                    description="Installs {pkg_name} {version}."
+                    visible="false">
+                <pkg-ref id="{identifier}"/>
+            </choice>
+
+        </installer-gui-script>
+    """)
+
+    dist_path = work_dir / "distribution.xml"
+    dist_path.write_text(xml)
+    ok(f"Generated distribution.xml: {dist_path}")
+    return dist_path
+
+
+# ── Core build steps ─────────────────────────────────────────────────────────
+
+def run_pkgbuild(
+    staging_root: Path,
+    scripts_dir: Path,
+    identifier: str,
+    version: str,
+    has_scripts: bool,
+    component_pkg: Path,
+) -> None:
+    step("Running pkgbuild")
+    pkgbuild = require_tool("pkgbuild")
+    cmd = [
+        pkgbuild,
+        "--root",            str(staging_root),
+        "--identifier",      identifier,
+        "--version",         version,
+        "--install-location", "/",
+        str(component_pkg),
+    ]
+    if has_scripts:
+        cmd = cmd[:2] + ["--scripts", str(scripts_dir)] + cmd[2:]
+    run(cmd)
+    ok(f"Component package: {component_pkg}")
+
+
+def run_productbuild(
+    dist_xml: Path,
+    resources_dir: Path,
+    component_pkg: Path,
+    output_pkg: Path,
+    sign_identity: Optional[str],
+    has_resources: bool,
+) -> None:
+    step("Running productbuild")
+    productbuild = require_tool("productbuild")
+    cmd = [
+        productbuild,
+        "--distribution",  str(dist_xml),
+        "--package-path",  str(component_pkg.parent),
+    ]
+    if has_resources:
+        cmd += ["--resources", str(resources_dir)]
+    if sign_identity:
+        cmd += ["--sign", sign_identity]
+    cmd.append(str(output_pkg))
+    run(cmd)
+    ok(f"Product package: {output_pkg}")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Build a macOS .pkg installer from a JSON config.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            JSON config keys:
+              package            (required) Package name, e.g. "MyApp"
+              version            (required) Version string, e.g. "1.0.0"
+              payload            (required) List of {src, dest} objects
+              preinstall_script  (optional) Path to preinstall script
+              postinstall_script (optional) Path to postinstall script
+              plist              (optional) Path to LaunchDaemon plist (auto-generated if omitted)
+              config             (optional) Path to distribution.xml (auto-generated if omitted)
+              resources          (optional) Object with: welcome, license, background_img paths
+        """),
+    )
+    parser.add_argument("config_json", help="Path to the JSON config file")
+    parser.add_argument(
+        "--output-dir", "-o",
+        default=".",
+        help="Directory to write the final .pkg into (default: current directory)",
+    )
+    parser.add_argument(
+        "--sign",
+        metavar="IDENTITY",
+        default=None,
+        help='Developer ID Installer identity, e.g. "Developer ID Installer: Acme (TEAMID)"',
+    )
+    parser.add_argument(
+        "--keep-staging",
+        action="store_true",
+        help="Keep the temporary staging directory after building (useful for debugging)",
+    )
+    parser.add_argument(
+        "--identifier",
+        default=None,
+        help="Override the reverse-DNS bundle identifier (default: com.company.<package>)",
+    )
+    args = parser.parse_args()
+
+    require_macos()
+
+    # ── Load & validate config ──────────────────────────────────────────────
+    config_path = Path(args.config_json).expanduser().resolve()
+    if not config_path.exists():
+        error(f"Config file not found: {config_path}")
+        sys.exit(1)
+
+    with config_path.open() as fh:
+        try:
+            cfg = json.load(fh)
+        except json.JSONDecodeError as exc:
+            error(f"Invalid JSON: {exc}")
+            sys.exit(1)
+
+    validate_config(cfg)
+    config_dir = config_path.parent
+
+    pkg_name   = cfg["package"]
+    version    = cfg["version"]
+    identifier = args.identifier or f"com.company.{pkg_name}"
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    final_pkg      = output_dir / f"{pkg_name}-{version}.pkg"
+    component_name = f"{pkg_name}-component.pkg"
+
+    info(f"Package     : {pkg_name} {version}")
+    info(f"Identifier  : {identifier}")
+    info(f"Output      : {final_pkg}")
+
+    # ── Create temp working directory ───────────────────────────────────────
+    tmp_base = tempfile.mkdtemp(prefix=f"build_pkg_{pkg_name}_")
+    work_dir      = Path(tmp_base)
+    staging_root  = work_dir / "payload"
+    scripts_dir   = work_dir / "scripts"
+    resources_dir = work_dir / "resources"
+    component_pkg = work_dir / component_name
+
+    staging_root.mkdir()
+    scripts_dir.mkdir()
+    resources_dir.mkdir()
+
+    info(f"Staging dir : {work_dir}")
+
+    try:
+        # ── Stage everything ────────────────────────────────────────────────
+        stage_payload(cfg, config_dir, staging_root)
+
+        has_scripts = bool(cfg.get("preinstall_script") or cfg.get("postinstall_script"))
+        stage_scripts(cfg, config_dir, scripts_dir)
+
+        resources_staged = stage_resources(cfg, config_dir, resources_dir)
+        has_resources = bool(resources_staged)
+
+        generate_plist(cfg, config_dir, staging_root, work_dir)
+
+        # ── pkgbuild ────────────────────────────────────────────────────────
+        run_pkgbuild(
+            staging_root=staging_root,
+            scripts_dir=scripts_dir,
+            identifier=identifier,
+            version=version,
+            has_scripts=has_scripts,
+            component_pkg=component_pkg,
+        )
+
+        # ── distribution.xml ────────────────────────────────────────────────
+        dist_xml = generate_distribution_xml(
+            cfg=cfg,
+            config_dir=config_dir,
+            component_pkg=component_pkg,
+            resources_staged=resources_staged,
+            work_dir=work_dir,
+        )
+
+        # ── productbuild ────────────────────────────────────────────────────
+        run_productbuild(
+            dist_xml=dist_xml,
+            resources_dir=resources_dir,
+            component_pkg=component_pkg,
+            output_pkg=final_pkg,
+            sign_identity=args.sign,
+            has_resources=has_resources,
+        )
+
+    finally:
+        if args.keep_staging:
+            info(f"Staging directory preserved: {work_dir}")
+        else:
+            shutil.rmtree(tmp_base, ignore_errors=True)
+            info("Staging directory cleaned up.")
+
+    print()
+    ok(f"✓ Package ready: {final_pkg}")
+
+    if args.sign:
+        step("Verifying signature")
+        run(["pkgutil", "--check-signature", str(final_pkg)])
+        print()
+        info("To notarize, run:")
+        print(f"""
+  xcrun notarytool submit {final_pkg} \\
+      --apple-id you@example.com \\
+      --team-id YOURTEAMID \\
+      --password @keychain:AC_PASSWORD \\
+      --wait
+
+  xcrun stapler staple {final_pkg}
+""")
+
+
+if __name__ == "__main__":
+    main()
