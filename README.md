@@ -76,6 +76,7 @@ mackage myapp.json \
 | `postinstall_script` | string   | Path to a script that runs after the payload is installed.                                        |
 | `plist`              | string   | Path to a LaunchDaemon plist. If omitted, a minimal plist is auto-generated for the first payload entry and installed to `/Library/LaunchDaemons/`. |
 | `config`             | string   | Path to a custom `distribution.xml`. If omitted, one is auto-generated.                           |
+| `app_bundle`         | string \| object | Path to a compiled `*.app` bundle to bundle into the `.pkg`. A string installs the bundle to `/Applications/<name>.app`. An object `{"src": "...", "dest": "/absolute/path"}` lets you override the install location. |
 | `resources`          | object   | Installer-UI assets. See below.                                                                   |
 
 ### `resources` object
@@ -98,6 +99,7 @@ the JSON config.
   "preinstall_script": "scripts/preinstall.sh",
   "postinstall_script": "scripts/postinstall.sh",
   "plist": "resources/com.example.myapp.plist",
+  "app_bundle": "build/MyApp.app",
 
   "resources": {
     "welcome": "resources/welcome.html",

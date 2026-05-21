@@ -6,6 +6,7 @@
   "plist": "/path/to/app.plist",
   "config": "/path/to/distribution.xml",
   "identifier_prefix": "com.my_company",
+  "app_bundle": "/path/to/MyApp.app",
 
   "resources":{
     "welcome": "/path/to/welcome.html",

@@ -28,11 +28,17 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Required top-level keys   : package, version, payload
 # Optional top-level keys   : preinstall_script, postinstall_script, plist,
-#                             config, resources { welcome, license, background_img }
+#                             config, app_bundle,
+#                             resources { welcome, license, background_img }
 #
 # payload is a list of objects, each with:
 #   src  – absolute path to the source file on this machine
 #   dest – absolute path where the file should land on the target machine
+#
+# app_bundle (optional) installs a compiled .app bundle on the target.
+#   It may be either:
+#     - a string  : path to a *.app directory; installed to /Applications/<name>.app
+#     - an object : {"src": "<path>", "dest": "<absolute install path>"}
 # ---------------------------------------------------------------------------
 
 
@@ -109,6 +115,16 @@ def validate_config(cfg: dict) -> None:
                 error(f"payload[{i}] is missing the '{field}' key.")
                 sys.exit(1)
 
+    app_bundle = cfg.get("app_bundle")
+    if app_bundle is not None:
+        if isinstance(app_bundle, dict):
+            if "src" not in app_bundle:
+                error("'app_bundle' object is missing the 'src' key.")
+                sys.exit(1)
+        elif not isinstance(app_bundle, str):
+            error("'app_bundle' must be a string path or an object with 'src' (and optional 'dest').")
+            sys.exit(1)
+
 
 def resolve_path(raw: str, config_dir: Path) -> Path:
     """Resolve a path that may be absolute or relative to the config file's directory."""
@@ -163,6 +179,51 @@ def stage_payload(cfg: dict, config_dir: Path, staging_root: Path) -> None:
         shutil.copy2(plist_src, plist_dest)
         plist_dest.chmod(0o644)
         ok(f"Staged plist: {plist_src} → {plist_dest}")
+
+
+def stage_app_bundle(cfg: dict, config_dir: Path, staging_root: Path) -> None:
+    """Copy an optional .app bundle into the staging tree.
+
+    Accepts either a string path (installed to /Applications/<name>.app) or an
+    object {"src": ..., "dest": ...} for a custom install location on the target.
+    """
+    raw = cfg.get("app_bundle")
+    if not raw:
+        return
+
+    step("Staging .app bundle")
+
+    if isinstance(raw, dict):
+        src_raw  = raw["src"]
+        dest_raw = raw.get("dest")
+    else:
+        src_raw  = raw
+        dest_raw = None
+
+    src = resolve_path(src_raw, config_dir)
+    if not src.exists():
+        error(f".app bundle not found: {src}")
+        sys.exit(1)
+    if not src.is_dir() or src.suffix != ".app":
+        error(f"'app_bundle' must point to a *.app bundle directory: {src}")
+        sys.exit(1)
+
+    if dest_raw:
+        dest_abs = Path(dest_raw)
+        if not dest_abs.is_absolute():
+            error(f"'app_bundle.dest' must be an absolute target path: {dest_raw}")
+            sys.exit(1)
+    else:
+        dest_abs = Path("/Applications") / src.name
+
+    relative_dest = Path(str(dest_abs).lstrip("/"))
+    staged = staging_root / relative_dest
+    if staged.exists():
+        shutil.rmtree(staged)
+    staged.parent.mkdir(parents=True, exist_ok=True)
+
+    shutil.copytree(src, staged, symlinks=True)
+    ok(f"Staged .app bundle: {src} → {staged}")
 
 
 def stage_scripts(cfg: dict, config_dir: Path, scripts_dir: Path) -> None:
@@ -408,6 +469,9 @@ def main() -> None:
               identifier_prefix  (optional) Reverse-DNS prefix prepended to <package> for the
                                  bundle identifier (default: "com.company"). Ignored if
                                  --identifier is given on the command line.
+              app_bundle         (optional) Path to a compiled *.app bundle. Either a string
+                                 (installed to /Applications/<name>.app) or an object
+                                 {"src": ..., "dest": ...} for a custom install path.
               resources          (optional) Object with: welcome, license, background_img paths
         """),
     )
@@ -483,6 +547,7 @@ def main() -> None:
     try:
         # ── Stage everything ────────────────────────────────────────────────
         stage_payload(cfg, config_dir, staging_root)
+        stage_app_bundle(cfg, config_dir, staging_root)
 
         has_scripts = bool(cfg.get("preinstall_script") or cfg.get("postinstall_script"))
         stage_scripts(cfg, config_dir, scripts_dir)
