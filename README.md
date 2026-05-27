@@ -20,21 +20,19 @@ optional code signing.
 
 ### Homebrew
 
-A Homebrew formula is provided in [`Formula/mackage.rb`](Formula/mackage.rb).
-Modern Homebrew installs formulae from a tap, so add this one to a local tap
-and install it:
-
 ```bash
-brew tap-new local/mackage --no-git
-cp Formula/mackage.rb "$(brew --repository local/mackage)/Formula/"
-brew install local/mackage/mackage
+brew tap tactcomplabs/mackage
+brew install mackage
 ```
 
 To install the latest `main` instead of the tagged release, append `--HEAD`:
 
 ```bash
-brew install --HEAD local/mackage/mackage
+brew install --HEAD tactcomplabs/mackage/mackage
 ```
+
+The formula lives in the [tactcomplabs/homebrew-mackage](https://github.com/tactcomplabs/homebrew-mackage)
+tap and is bumped automatically on each new release tag.
 
 ### Manual
 
