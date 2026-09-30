@@ -26,12 +26,17 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # JSON SCHEMA (validated at runtime)
 # ---------------------------------------------------------------------------
-# Required top-level keys   : package, version, payload
-# Optional top-level keys   : preinstall_script, postinstall_script, plist,
-#                             config, app_bundle,
+# Required top-level keys   : package, version
+# Optional top-level keys   : payload, preinstall_script, postinstall_script,
+#                             plist, config, app_bundle,
 #                             resources { welcome, license, background_img }
 #
-# payload is a list of objects, each with:
+# At least one of payload (non-empty) or app_bundle must be given.
+#
+# plist may be a path, or false to skip the auto-generated LaunchDaemon.
+# No plist is generated when payload is empty (e.g. an app-only package).
+#
+# payload (optional) is a list of objects, each with:
 #   src  – absolute path to the source file on this machine
 #   dest – absolute path where the file should land on the target machine
 #
@@ -92,7 +97,7 @@ def run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subproc
 
 def validate_config(cfg: dict) -> None:
     """Validate required fields and types in the JSON config."""
-    required = ("package", "version", "payload")
+    required = ("package", "version")
     for key in required:
         if key not in cfg:
             error(f"Missing required JSON key: '{key}'")
@@ -102,8 +107,17 @@ def validate_config(cfg: dict) -> None:
         error("'package' must contain only letters, digits, dots, hyphens, underscores.")
         sys.exit(1)
 
-    if not isinstance(cfg["payload"], list) or len(cfg["payload"]) == 0:
-        error("'payload' must be a non-empty list.")
+    payload = cfg.setdefault("payload", [])
+    if not isinstance(payload, list):
+        error("'payload' must be a list.")
+        sys.exit(1)
+    if not payload and not cfg.get("app_bundle"):
+        error("Nothing to install: give a non-empty 'payload' and/or an 'app_bundle'.")
+        sys.exit(1)
+
+    plist = cfg.get("plist")
+    if plist is not None and plist is not False and not isinstance(plist, str):
+        error("'plist' must be a path string, or false to skip LaunchDaemon generation.")
         sys.exit(1)
 
     for i, entry in enumerate(cfg["payload"]):
@@ -284,14 +298,22 @@ def stage_resources(cfg: dict, config_dir: Path, resources_dir: Path) -> dict[st
 
 # ── Plist / distribution.xml generation ─────────────────────────────────────
 
-def generate_plist(cfg: dict, config_dir: Path, staging_root: Path, work_dir: Path) -> Path:
+def generate_plist(cfg: dict, config_dir: Path, staging_root: Path, work_dir: Path) -> Optional[Path]:
     """
     If no plist is given, generate a minimal LaunchDaemon plist and stage it.
-    Returns the path to the generated (or confirmed existing) plist.
+    Returns the path to the generated (or confirmed existing) plist, or None
+    when generation is skipped ("plist": false, or an empty payload with no
+    binary for a daemon to run).
     """
+    if cfg.get("plist") is False:
+        info("LaunchDaemon plist disabled (\"plist\": false) — skipping.")
+        return None
     if cfg.get("plist"):
         # Already handled in stage_payload
         return resolve_path(cfg["plist"], config_dir)
+    if not cfg["payload"]:
+        info("Empty payload — no LaunchDaemon plist generated.")
+        return None
 
     step("Generating default LaunchDaemon plist")
     pkg_name = cfg["package"]
@@ -461,10 +483,13 @@ def main() -> None:
             JSON config keys:
               package            (required) Package name, e.g. "MyApp"
               version            (required) Version string, e.g. "1.0.0"
-              payload            (required) List of {src, dest} objects
+              payload            (optional) List of {src, dest} objects; may be omitted or
+                                 empty when app_bundle is given
               preinstall_script  (optional) Path to preinstall script
               postinstall_script (optional) Path to postinstall script
-              plist              (optional) Path to LaunchDaemon plist (auto-generated if omitted)
+              plist              (optional) Path to LaunchDaemon plist, or false to skip it.
+                                 Auto-generated for payload[0] if omitted and payload
+                                 is non-empty.
               config             (optional) Path to distribution.xml (auto-generated if omitted)
               identifier_prefix  (optional) Reverse-DNS prefix prepended to <package> for the
                                  bundle identifier (default: "com.company"). Ignored if
