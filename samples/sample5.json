@@ -1,0 +1,7 @@
+{
+  "package": "sample5",
+  "version": "1.0.0",
+  "identifier_prefix": "com.my_company",
+  "app_bundle": "/path/to/MyApp.app",
+  "plist": false
+}

@@ -86,15 +86,15 @@ mackage myapp.json \
 | --------- | -------------------------- | ---------------------------------------------------------------------------------------- |
 | `package` | string                     | Package name. Letters, digits, dots, hyphens, and underscores only.                      |
 | `version` | string                     | Version string, e.g. `"1.0.0"` or a date like `"2026-05-17"`.                            |
-| `payload` | list of `{src, dest}`      | Non-empty list of files to install. `src` is the source path on the build machine; `dest` is the absolute install path on the target machine. |
 
 ### Optional keys
 
 | Key                  | Type     | Description                                                                                       |
 | -------------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `payload`            | list of `{src, dest}` | Files to install. `src` is the source path on the build machine; `dest` is the absolute install path on the target machine. May be omitted or empty when `app_bundle` is given; otherwise it must be non-empty. |
 | `preinstall_script`  | string   | Path to a script that runs before the payload is installed.                                       |
 | `postinstall_script` | string   | Path to a script that runs after the payload is installed.                                        |
-| `plist`              | string   | Path to a LaunchDaemon plist. If omitted, a minimal plist is auto-generated for the first payload entry and installed to `/Library/LaunchDaemons/`. |
+| `plist`              | string \| `false` | Path to a LaunchDaemon plist. If omitted and `payload` is non-empty, a minimal plist is auto-generated for the first payload entry and installed to `/Library/LaunchDaemons/`. Set to `false` to skip it (no plist is ever generated for an empty payload). |
 | `config`             | string   | Path to a custom `distribution.xml`. If omitted, one is auto-generated.                           |
 | `app_bundle`         | string \| object | Path to a compiled `*.app` bundle to bundle into the `.pkg`. A string installs the bundle to `/Applications/<name>.app`. An object `{"src": "...", "dest": "/absolute/path"}` lets you override the install location. |
 | `resources`          | object   | Installer-UI assets. See below.                                                                   |
@@ -140,6 +140,17 @@ the JSON config.
 }
 ```
 
+An app-only package (just a `.app` bundle, no daemon) needs only:
+
+```json
+{
+  "package": "MyApp",
+  "version": "1.0.0",
+  "app_bundle": "build/MyApp.app",
+  "plist": false
+}
+```
+
 See the [`samples/`](samples/) directory for additional examples.
 
 ## How it works
@@ -152,7 +163,8 @@ See the [`samples/`](samples/) directory for additional examples.
 4. Stages optional `preinstall` / `postinstall` scripts (renamed as required
    by `pkgbuild`) and marks them executable.
 5. Stages installer-UI resources (welcome, license, background).
-6. Generates a default LaunchDaemon plist if none is supplied.
+6. Generates a default LaunchDaemon plist if none is supplied (skipped when
+   `plist` is `false` or the payload is empty).
 7. Runs `pkgbuild` to produce a component package.
 8. Generates a `distribution.xml` if none is supplied.
 9. Runs `productbuild` to produce the final product package, signing it
