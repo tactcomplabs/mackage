@@ -1,0 +1,42 @@
+name: Bump Homebrew tap formula
+
+# Updates url + sha256 in tactcomplabs/homebrew-mackage whenever a release is
+# published here. Run manually via "Run workflow" to (re)publish a given tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish to the tap (e.g. v1.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "name=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump formula in tactcomplabs/homebrew-mackage
+        uses: mislav/bump-homebrew-formula-action@v4
+        with:
+          formula-name: mackage
+          formula-path: Formula/mackage.rb
+          homebrew-tap: tactcomplabs/homebrew-mackage
+          base-branch: main
+          tag-name: ${{ steps.tag.outputs.name }}
+          download-url: https://github.com/tactcomplabs/mackage/archive/refs/tags/${{ steps.tag.outputs.name }}.tar.gz
+          commit-message: |
+            mackage {{version}}
+
+            Automated bump from tactcomplabs/mackage release {{version}}.
+        env:
+          # Fine-grained PAT with Contents:write on tactcomplabs/homebrew-mackage
+          # (or a classic PAT with `repo` scope). Set via:
+          #   gh secret set HOMEBREW_TAP_TOKEN -R tactcomplabs/mackage
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
